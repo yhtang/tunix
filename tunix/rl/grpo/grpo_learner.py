@@ -185,6 +185,8 @@ class GrpoLearner:
       training_config: GrpoConfig,
       trainer_mesh: None | Mesh = None,
       rollout_worker_mesh: None | Mesh = None,
+      force_sync_sampler_weights: bool = False,
+      timer: None = None,
   ):
     """Initializes the `GrpoTrainer`.
 
@@ -255,14 +257,11 @@ class GrpoLearner:
     )
     self.need_sync_sampler_weights = (
         self.trainer_mesh != self.rollout_worker_mesh
-    )
-    if self.need_sync_sampler_weights:
-      raise ValueError(
-          "Different trainer and sampler meshes are not supported for now. We"
-          " are working on the binary release. Stay tuned."
-      )
+    ) or force_sync_sampler_weights
     self.executor = futures.ThreadPoolExecutor(max_workers=1)
     self._last_train_step = self.trainer.train_steps
+
+    self._timer = timer
 
   def _get_metric_logging_steps(self, mode: metrics_logger.Mode) -> int:
     return (
@@ -511,27 +510,25 @@ class GrpoLearner:
 
   def sync_sampler_weights(self):
     """Syncs the weights of between the sampler model and trainer model."""
-    # if jax.devices():
-    #   cm = contextlib.ExitStack()
-    #   cm.enter_context(jax.transfer_guard_device_to_host("disallow_explicit"))
-    #   cm.enter_context(jax.transfer_guard_host_to_device("disallow_explicit"))
-    # else:
-    #   cm = contextlib.nullcontext()
-    # with cm:
-    #   if utils.is_lora_enabled(self.trainer.model):
-    #     src_lora_params = nnx.state(self.trainer.model, nnx.LoRAParam)
-    #     dst_lora_params =
-    #       nnx.state(self.rollout_worker.model(), nnx.LoRAParam)
-    #     resharded_lora_params = reshard.reshard_pytree(
-    #         src_lora_params, dst_lora_params
-    #     )
-    #     self.rollout_worker.update_params(resharded_lora_params)
-    #   else:
-    #     src_params = nnx.state(self.trainer.model, nnx.Param)
-    #     dst_params = nnx.state(self.rollout_worker.model(), nnx.Param)
-    #     resharded_params = reshard.reshard_pytree(src_params, dst_params)
-    #     self.rollout_worker.update_params(resharded_params)
-    pass
+    if jax.devices():
+      cm = contextlib.ExitStack()
+      # cm.enter_context(jax.transfer_guard_device_to_host("disallow_explicit"))
+      # cm.enter_context(jax.transfer_guard_host_to_device("disallow_explicit"))
+    else:
+      cm = contextlib.nullcontext()
+    with cm:
+      if utils.is_lora_enabled(self.trainer.model):
+        src_lora_params = nnx.state(self.trainer.model, nnx.LoRAParam)
+        dst_lora_params = nnx.state(self.rollout_worker.model(), nnx.LoRAParam)
+        resharded_lora_params = reshard.reshard_pytree(
+            src_lora_params, dst_lora_params
+        )
+        self.rollout_worker.update_params(resharded_lora_params)
+      else:
+        src_params = nnx.state(self.trainer.model, nnx.Param)
+        dst_params = nnx.state(self.rollout_worker.model(), nnx.Param)
+        resharded_params = reshard.reshard_pytree(src_params, dst_params)
+        self.rollout_worker.update_params(resharded_params)
 
   def train(
       self,
@@ -575,70 +572,97 @@ class GrpoLearner:
       skip_jit: Whether to skip JIT compilation of the training loop.
     """
     train_iterator = iter(train_ds)
+    print('ZZZZZZZZZZZZZZZZ.1')
     while True:  # loop over M
-      try:
-        # reserve 1 for None and the other for repeated interable
-        # if batch_repeat > 1
-        train_data_queue = queue_lib.SimpleDataQueue(
-            maxsize=self.grad_acc_steps + 2
-        )
-        # reserve 1 for None
-        eval_data_queue = queue_lib.SimpleDataQueue(maxsize=2)
-        initial_train_steps = self._train_steps
-        future = self.executor.submit(
-            self.prepare_dataset,
-            iterator=train_iterator,
-            proceed_num_steps=self.grad_acc_steps,
-            sample_repeat=self.grpo_config.num_generations,
-            batch_repeat=self.grpo_config.num_iterations,
-            data_queue=train_data_queue,
-            # only do async rollout and training if we know that sampler
-            # and trainer don't deploy to the same devices. If they do, don't
-            # make sense for the interleave because they will have contention.
-            async_loading=True if self.need_sync_sampler_weights else False,
-            mode=metrics_logger.Mode.TRAIN,
-        )
-        curr_eval_ds = None
-        with jax.profiler.StepTraceAnnotation(
-            "trainer", step_num=initial_train_steps
-        ):
-          while True:
-            with self.trainer_mesh:
-              curr_train_ds = train_data_queue.get(block=True)
-              if curr_train_ds is None:
-                break
-              if eval_ds and not curr_eval_ds:
-                self.prepare_dataset(
-                    iterator=iter(eval_ds),
-                    proceed_num_steps=-1,
-                    sample_repeat=self.grpo_config.num_generations,
-                    batch_repeat=1,
-                    data_queue=eval_data_queue,
-                    async_loading=False,
-                    mode=metrics_logger.Mode.EVAL,
-                )
-                curr_eval_ds = eval_data_queue.get(block=True)
-              self.trainer.train(
-                  curr_train_ds,
-                  curr_eval_ds,
-                  skip_jit,
-              )  # loop over μ
-        # call to throw stop iteration as a singal to break the loop
-        future.result()
-        # sync the train steps with internel trainer, this is based on the
-        # assumption that the trainer internally doesn't reset the train steps.
-        # there is current a unit test to ensure this assumption.
-        self._train_steps = self.trainer.train_steps
-        if self.need_sync_sampler_weights:
-          with jax.profiler.StepTraceAnnotation(
-              "sync_sampler_weights", step_num=initial_train_steps
-          ):
-            self.sync_sampler_weights()
-        if self._train_steps >= self.grpo_config.max_steps:
+      print('ZZZZZZZZZZZZZZZZ.2')
+      with self._timer.section("train_step"):
+        print('ZZZZZZZZZZZZZZZZ.3')
+        try:
+          # reserve 1 for None and the other for repeated interable
+          # if batch_repeat > 1
+          print('ZZZZZZZZZZZZZZZZ.4')
+          with self._timer.section("data_queue"):
+            train_data_queue = queue_lib.SimpleDataQueue(
+                maxsize=self.grad_acc_steps + 2
+            )
+            # reserve 1 for None
+            eval_data_queue = queue_lib.SimpleDataQueue(maxsize=2)
+          initial_train_steps = self._train_steps
+          print('ZZZZZZZZZZZZZZZZ.5')
+          with self._timer.section("X"):
+            print('ZZZZZZZZZZZZZZZZ.6')
+            future = self.executor.submit(
+                self.prepare_dataset,
+                iterator=train_iterator,
+                proceed_num_steps=self.grad_acc_steps,
+                sample_repeat=self.grpo_config.num_generations,
+                batch_repeat=self.grpo_config.num_iterations,
+                data_queue=train_data_queue,
+                # only do async rollout and training if we know that sampler
+                # and trainer don't deploy to the same devices. If they do, don't
+                # make sense for the interleave because they will have contention.
+                async_loading=True if self.need_sync_sampler_weights else False,
+                mode=metrics_logger.Mode.TRAIN,
+            )
+            print('ZZZZZZZZZZZZZZZZ.7')
+            curr_eval_ds = None
+            with jax.profiler.StepTraceAnnotation(
+                "trainer", step_num=initial_train_steps
+            ):
+              print('ZZZZZZZZZZZZZZZZ.8')
+              while True:
+                print('ZZZZZZZZZZZZZZZZ.9')
+                with self.trainer_mesh:
+                  curr_train_ds = train_data_queue.get(block=True)
+                  print('ZZZZZZZZZZZZZZZZ.A')
+                  print(f'curr_train_ds={curr_train_ds}')
+                  if curr_train_ds is None:
+                    break
+                  with self._timer.section("eval_ds"):
+                    print('ZZZZZZZZZZZZZZZZ.B')
+                    if eval_ds and not curr_eval_ds:
+                      print('ZZZZZZZZZZZZZZZZ.C')
+                      self.prepare_dataset(
+                          iterator=iter(eval_ds),
+                          proceed_num_steps=-1,
+                          sample_repeat=self.grpo_config.num_generations,
+                          batch_repeat=1,
+                          data_queue=eval_data_queue,
+                          async_loading=False,
+                          mode=metrics_logger.Mode.EVAL,
+                      )
+                      print('ZZZZZZZZZZZZZZZZ.D')
+                      curr_eval_ds = eval_data_queue.get(block=True)
+                      print('ZZZZZZZZZZZZZZZZ.E')
+                  with self._timer.section("self-trainer-train"):
+                    print('ZZZZZZZZZZZZZZZZ.F')
+                    self.trainer.train(
+                        curr_train_ds,
+                        curr_eval_ds,
+                        skip_jit,
+                    )  # loop over μ
+                    print('ZZZZZZZZZZZZZZZZ.G')
+            # call to throw stop iteration as a singal to break the loop
+            with self._timer.section("wait_for_future"):
+              future.result()
+          # sync the train steps with internel trainer, this is based on the
+          # assumption that the trainer internally doesn't reset the train steps.
+          # there is current a unit test to ensure this assumption.
+          self._train_steps = self.trainer.train_steps
+          with self._timer.section("sync_sampler_weights"):
+            if self.need_sync_sampler_weights:
+              with jax.profiler.StepTraceAnnotation(
+                  "sync_sampler_weights", step_num=initial_train_steps
+              ):
+                self.sync_sampler_weights()
+          if self._train_steps >= self.grpo_config.max_steps:
+            break
+        except StopIteration:
           break
-      except StopIteration:
-        break
+      print('ZZZZZZZZZZZZZZZZ.Z')
+    print('ZZZZZZZZZZZZZZZZ.ZZ')
     self.trainer.close()
+    print('ZZZZZZZZZZZZZZZZ.ZZZ')
 
 
 def grpo_loss_fn(model, train_example, beta, epsilon):
