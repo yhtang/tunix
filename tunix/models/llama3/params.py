@@ -91,7 +91,7 @@ def _torch_key_to_jax_key(mapping, source_key):
     return subs[0]
 
 
-def _assign_weights(keys, tensor, state_dict, torch_key, transform):
+def _assign_weights(keys, tensor, state_dict, torch_key, transform, sharding_subtree=None, default_device=None):
   """Convert weights and assign to nnx state_dict."""
   key = keys[0]
   if len(keys) == 1:
@@ -111,12 +111,22 @@ def _assign_weights(keys, tensor, state_dict, torch_key, transform):
           f"shape must match for {torch_key}, got {tensor.shape} vs"
           f" {state_dict[key].shape}"
       )
+
+    # Place tensor on the appropriate device/sharding early to avoid OOMs.
+    if sharding_subtree is not None:
+      tensor = jax.device_put(tensor, sharding_subtree[key])
+    elif default_device is not None:
+      tensor = jax.device_put(tensor, default_device)
+
     state_dict[key] = tensor
     return state_dict
   else:
     if key not in state_dict:
       raise ValueError(f"Unfound key {key} in {state_dict}")
-    _assign_weights(keys[1:], tensor, state_dict[key], torch_key, transform)
+    next_sharding = None
+    if sharding_subtree is not None:
+      next_sharding = sharding_subtree[key]
+    _assign_weights(keys[1:], tensor, state_dict[key], torch_key, transform, next_sharding, default_device)
     return state_dict
 
 
@@ -138,10 +148,7 @@ def create_model_from_safe_tensors(
   if not files:
     raise ValueError(f"No safetensors found in {file_dir}")
 
-  tensor_dict = {}
-  for f in files:
-    tensor_dict |= safetensors.load_file(f)
-
+  # Construct abstract model and state dict shapes
   llama3 = nnx.eval_shape(
       lambda: model_lib.Llama3(config, rngs=nnx.Rngs(params=0))
   )
@@ -149,17 +156,23 @@ def create_model_from_safe_tensors(
   graph_def, abs_state = nnx.split(llama3)
   state_dict = abs_state.to_pure_dict()
 
-  for k, v in tensor_dict.items():
-    jax_key, transform = _torch_key_to_jax_key(
-        _get_key_and_transform_mapping(config), k
-    )
-    jax_keys = [_stoi(s) for s in jax_key.split(".")]
-    _assign_weights(jax_keys, v, state_dict, k, transform)
-
+  # Prepare per-parameter sharding, if a mesh is provided
+  sharding_dict = None
+  default_device = None
   if mesh is not None:
-    sharding = nnx.get_named_sharding(abs_state, mesh).to_pure_dict()
-    state_dict = jax.device_put(state_dict, sharding)
+    sharding_dict = nnx.get_named_sharding(abs_state, mesh).to_pure_dict()
   else:
-    state_dict = jax.device_put(state_dict, jax.devices()[0])
+    # Place on a single device eagerly for each tensor
+    default_device = jax.devices()[0]
+
+  # Stream tensors file-by-file and place each tensor immediately
+  for f in files:
+    file_tensors = safetensors.load_file(f)
+    for k, v in file_tensors.items():
+      jax_key, transform = _torch_key_to_jax_key(
+          _get_key_and_transform_mapping(config), k
+      )
+      jax_keys = [_stoi(s) for s in jax_key.split(".")]
+      _assign_weights(jax_keys, v, state_dict, k, transform, sharding_dict, default_device)
 
   return nnx.merge(graph_def, state_dict)
