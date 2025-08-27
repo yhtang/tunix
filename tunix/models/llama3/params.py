@@ -143,7 +143,7 @@ def create_model_from_safe_tensors(
     mesh: jax.sharding.Mesh | None = None,
 ) -> model_lib.Llama3:
   """Load tensors from the safetensors file and create a Llama3 model."""
-  files = list(epath.Path(file_dir).expanduser().glob("*.safetensors"))
+  files = sorted(list(epath.Path(file_dir).expanduser().glob("*.safetensors")))
 
   if not files:
     raise ValueError(f"No safetensors found in {file_dir}")
@@ -174,5 +174,6 @@ def create_model_from_safe_tensors(
       )
       jax_keys = [_stoi(s) for s in jax_key.split(".")]
       _assign_weights(jax_keys, v, state_dict, k, transform, sharding_dict, default_device)
+      print(f'Loaded {k} with shape {v.shape} from {f}')
 
   return nnx.merge(graph_def, state_dict)
