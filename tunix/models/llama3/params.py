@@ -150,7 +150,7 @@ def create_model_from_safe_tensors(
 
   # Construct abstract model and state dict shapes
   llama3 = nnx.eval_shape(
-      lambda: model_lib.Llama3(config, rngs=nnx.Rngs(params=0))
+      lambda: model_lib.Llama3(config, rngs=nnx.Rngs(params=0), shd_config=config.shd_config)
   )
 
   graph_def, abs_state = nnx.split(llama3)
