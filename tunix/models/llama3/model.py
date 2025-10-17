@@ -1,6 +1,6 @@
 # Copyright 2025 Google LLC
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
+# Licensed under the Apache License, Version 2.0 (the "License');
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
@@ -15,7 +15,9 @@
 """LLama3 model."""
 
 import dataclasses
+import enum
 from typing import Tuple
+
 import flax
 from flax import nnx
 import jax
@@ -23,12 +25,22 @@ from jax import numpy as jnp
 from jax.interpreters import pxla
 import jax.sharding as shd
 import jaxtyping
-
+from tunix.generate.mappings import BackendMappingMixin
+from tunix.utils import container
 
 K_MASK = -2.3819763e38
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
+
+
+if hasattr(flax.config, 'flax_always_shard_variable'):
+  flax.config.update('flax_always_shard_variable', False)
+
+
+class RematConfig(enum.Enum):
+  NONE = enum.auto()  # No remat, all activations will be stored in HBM.
+  BLOCK = enum.auto()  # Remat the entire attn block.
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -80,9 +92,11 @@ class ModelConfig:
   rope_theta: int
   norm_eps: float
   shd_config: ShardingConfig = ShardingConfig.get_default_sharding()
+  weight_tying: bool = False  # Llama3.2 features
+  remat_config: RematConfig = RematConfig.NONE
 
   @classmethod
-  def llama3_1b(cls):
+  def llama3_2_1b(cls):
     return cls(
         num_layers=16,
         vocab_size=128256,
@@ -93,10 +107,27 @@ class ModelConfig:
         num_kv_heads=8,
         norm_eps=1e-05,
         rope_theta=500_000,
+        weight_tying=True,
+    )
+
+  # Llama3.2 3B
+  @classmethod
+  def llama3_2_3b(cls):
+    return cls(
+        num_layers=28,  # ← from num_hidden_layers
+        vocab_size=128256,  # ← from vocab_size
+        embed_dim=3072,  # ← from hidden_size
+        hidden_dim=8192,  # ← from intermediate_size
+        num_heads=24,  # ← from num_attention_heads
+        head_dim=128,  # ← from head_dim
+        num_kv_heads=8,  # ← from num_key_value_heads
+        norm_eps=1e-05,  # ← from rms_norm_eps
+        rope_theta=500_000,  # ← from rope_theta
+        weight_tying=True,
     )
 
   @classmethod
-  def llama3_8b(cls):
+  def llama3_1_8b(cls):
     return cls(
         num_layers=32,
         vocab_size=128256,
@@ -107,6 +138,7 @@ class ModelConfig:
         num_kv_heads=8,
         norm_eps=1e-05,
         rope_theta=500_000,
+        weight_tying=False,
     )
 
 
@@ -228,44 +260,44 @@ class Attention(nnx.Module):
       config: ModelConfig,
       *,
       rngs: nnx.Rngs,
-      shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ):
-    self.shd_config = shd_config
+    self.config = config
+    self.shd_config = config.shd_config
     self.q_proj = Einsum(
         einsum_str='BTD,DNH->BTNH',
         shape=(config.embed_dim, config.num_heads, config.head_dim),
         rngs=rngs,
-        sharding=shd_config.q_weight_ndh,
+        sharding=self.shd_config.q_weight_ndh,
     )
     self.k_proj = Einsum(
         einsum_str='BSD,DKH->BSKH',
         shape=(config.embed_dim, config.num_kv_heads, config.head_dim),
         rngs=rngs,
-        sharding=shd_config.kv_weight_ndh,
+        sharding=self.shd_config.kv_weight_ndh,
     )
     self.v_proj = Einsum(
         einsum_str='BSD,DKH->BSKH',
         shape=(config.embed_dim, config.num_kv_heads, config.head_dim),
         rngs=rngs,
-        sharding=shd_config.kv_weight_ndh,
+        sharding=self.shd_config.kv_weight_ndh,
     )
     self.o_proj = Einsum(
         einsum_str='BTNH,NHD->BTD',
         shape=(config.num_heads, config.head_dim, config.embed_dim),
         rngs=rngs,
-        sharding=shd_config.o_weight_nhd,
+        sharding=self.shd_config.o_weight_nhd,
     )
     self.n_rep = config.num_heads // config.num_kv_heads
     self.scale = self.head_dim**-0.5
 
-  @jax.named_scope('attention')
-  def __call__(
+  def block(
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
       cache: LayerCache | None,
       attn_mask: jaxtyping.Array | None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    """Attention block."""
     seq_len = x.shape[1]
 
     query_proj = self.q_proj(x)
@@ -332,6 +364,19 @@ class Attention(nnx.Module):
 
     return new_cache, outputs
 
+  @jax.named_scope('attention')
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
+  ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    if self.config.remat_config == RematConfig.BLOCK:
+      return nnx.remat(self.block)(x, segment_pos, cache, attn_mask)
+    else:
+      return self.block(x, segment_pos, cache, attn_mask)
+
   @property
   def head_dim(self):
     return self.o_proj.shape[1]
@@ -342,7 +387,7 @@ class Attention(nnx.Module):
 
   @property
   def num_kv_heads(self):
-    return self.kv_proj.shape[1]
+    return self.k_proj.shape[1]
 
 
 class MLP(nnx.Module):
@@ -353,9 +398,8 @@ class MLP(nnx.Module):
       config: ModelConfig,
       *,
       rngs: nnx.Rngs,
-      shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ):
-    self.shd_config = shd_config
+    self.shd_config = config.shd_config
     kernel_init_fn = nnx.initializers.zeros_init()
     self.gate_proj = nnx.Linear(
         in_features=config.embed_dim,
@@ -363,7 +407,7 @@ class MLP(nnx.Module):
         use_bias=False,
         rngs=rngs,
         kernel_init=nnx.with_partitioning(
-            kernel_init_fn, shd_config.ffw_weight_df
+            kernel_init_fn, self.shd_config.ffw_weight_df
         ),
     )
     self.up_proj = nnx.Linear(
@@ -372,7 +416,7 @@ class MLP(nnx.Module):
         use_bias=False,
         rngs=rngs,
         kernel_init=nnx.with_partitioning(
-            kernel_init_fn, shd_config.ffw_weight_df
+            kernel_init_fn, self.shd_config.ffw_weight_df
         ),
     )
     self.down_proj = nnx.Linear(
@@ -381,7 +425,7 @@ class MLP(nnx.Module):
         use_bias=False,
         rngs=rngs,
         kernel_init=nnx.with_partitioning(
-            kernel_init_fn, shd_config.ffw_weight_fd
+            kernel_init_fn, self.shd_config.ffw_weight_fd
         ),
     )
 
@@ -401,29 +445,26 @@ class DecoderLayer(nnx.Module):
       config: ModelConfig,
       *,
       rngs: nnx.Rngs,
-      shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ):
     self.input_layernorm = RMSNorm(
         config.embed_dim,
         norm_eps=config.norm_eps,
         rngs=rngs,
-        shd_config=shd_config,
+        shd_config=config.shd_config,
     )
     self.attn = Attention(
         config=config,
         rngs=rngs,
-        shd_config=shd_config,
     )
     self.mlp = MLP(
         config=config,
         rngs=rngs,
-        shd_config=shd_config,
     )
     self.post_attention_layernorm = RMSNorm(
         config.embed_dim,
         norm_eps=config.norm_eps,
         rngs=rngs,
-        shd_config=shd_config,
+        shd_config=config.shd_config,
     )
 
   def __call__(
@@ -447,7 +488,7 @@ class DecoderLayer(nnx.Module):
     return cache, outputs
 
 
-class Llama3(nnx.Module):
+class Llama3(BackendMappingMixin, nnx.Module):
   """Llama3 model."""
 
   def __init__(
@@ -455,30 +496,30 @@ class Llama3(nnx.Module):
       config: ModelConfig,
       *,
       rngs: nnx.Rngs,
-      shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ):
+    self.config = config
     self.embedder = Embedder(
         vocab_size=config.vocab_size,
         embed_dim=config.embed_dim,
         rngs=rngs,
-        shd_config=shd_config,
+        shd_config=config.shd_config,
     )
-    self.layers = [
-        DecoderLayer(config=config, rngs=rngs, shd_config=shd_config)
-        for _ in range(config.num_layers)
-    ]
+    self.layers = container.ModuleList([
+        DecoderLayer(config=config, rngs=rngs) for _ in range(config.num_layers)
+    ])
     self.final_norm = RMSNorm(
         config.embed_dim,
         rngs=rngs,
         norm_eps=config.norm_eps,
-        shd_config=shd_config,
+        shd_config=config.shd_config,
     )
-    self.lm_head = Einsum(
-        einsum_str='BTD,DV->BTV',
-        shape=(config.embed_dim, config.vocab_size),
-        rngs=rngs,
-        sharding=shd_config.emb_dv,
-    )
+    if not config.weight_tying:
+      self.lm_head = Einsum(
+          einsum_str='BTD,DV->BTV',
+          shape=(config.embed_dim, config.vocab_size),
+          rngs=rngs,
+          sharding=config.shd_config.emb_dv,
+      )
 
   def get_model_input(self):
     """Returns a dummy model input for the transformer."""
@@ -534,6 +575,14 @@ class Llama3(nnx.Module):
         new_cache[layer_name] = layer_cache  # pytype: disable=container-type-mismatch
 
     x = self.final_norm(x)
-    logits = self.lm_head(x)
+
+    if self.config.weight_tying:
+      logits = self.embedder.decode(x)
+    else:
+      logits = self.lm_head(x)
 
     return logits, new_cache  # pytype: disable=bad-return-type
+
+  @property
+  def num_embed(self) -> int:
+    return self.config.embed_dim

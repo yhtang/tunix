@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import dataclasses
-from typing import Any
-from typing import Optional
+from typing import Any, Optional
+import warnings
 
 from absl import logging
 import flax
@@ -30,6 +30,7 @@ from flax.nnx import statelib
 import jax
 import jax.numpy as jnp
 import jaxtyping
+from tunix.generate import base_sampler
 from tunix.generate import utils
 import tunix.generate.beam_search as beam_search_lib
 import tunix.generate.tokenizer_adapter as tok_adapter
@@ -89,23 +90,6 @@ class _SamplingState:
   beam_search_sampling_state: (
       beam_search_lib._BeamSearchSamplingState | None
   ) = None
-
-
-@dataclasses.dataclass
-class SamplerOutput:
-  """Output of the sampler."""
-
-  # Decoded samples from the model.
-  text: list[str]
-
-  # Per-step logits used during sampling.
-  logits: list[jax.Array] | jax.Array
-
-  # Tokens corresponding to the generated samples.
-  tokens: list[jax.Array] | jax.Array
-
-  # Left padded prompt tokens.
-  padded_prompt_tokens: jax.Array
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,22 +156,18 @@ def _init_cache(
     The KV cache for one attention block.
   """
 
-  def _init_layer_cache() -> LayerCache:
-    return {
-        'k': jnp.zeros(
-            (batch_size, cache_size, num_kv_heads, head_dim), dtype=dtype
-        ),
-        'v': jnp.zeros(
-            (batch_size, cache_size, num_kv_heads, head_dim), dtype=dtype
-        ),
-        'end_index': jnp.zeros((batch_size,), dtype=jnp.int32),
-    }
-
-  cache = {f'layer_{i}': _init_layer_cache() for i in range(n_layers)}
-  return cache
+  shape = (batch_size, cache_size, num_kv_heads, head_dim)
+  k = jnp.zeros(shape, dtype=dtype)
+  v = jnp.zeros(shape, dtype=dtype)
+  end_index = jnp.zeros((batch_size,), dtype=jnp.int32)
+  # Jax array is immutable, so updates to each layer creates new arrays.
+  return {
+      f'layer_{i}': {'k': k, 'v': v, 'end_index': end_index}
+      for i in range(n_layers)
+  }
 
 
-class Sampler:
+class Sampler(base_sampler.BaseSampler):
   """Sampler for transformer model."""
 
   def __init__(
@@ -250,10 +230,34 @@ class Sampler:
         )
 
       def check_shape_dtype_sharding(x, y):
+
+        def equivalent_sharding(x, y):
+          # Lift the condition on memory_kind due to offloading.
+          # Besides it seems jax.jit might change some shardings of the params
+          # to equivalent representation so here we check if the specs are
+          # equivalent instead of checking the identity.
+          if isinstance(
+              x.sharding, jax.sharding.SingleDeviceSharding
+          ) and isinstance(y.sharding, jax.sharding.SingleDeviceSharding):
+            return x.sharding.device_set == y.sharding.device_set
+          if not (
+              isinstance(x.sharding, jax.sharding.NamedSharding)
+              and isinstance(y.sharding, jax.sharding.NamedSharding)
+          ):
+            return False
+          if x.sharding.mesh != y.sharding.mesh:
+            return False
+          mesh = x.sharding.mesh
+          diff_spec = list(set(x.sharding.spec) - set(y.sharding.spec))
+          for spec in diff_spec:
+            if spec and mesh.shape[spec] != 1:
+              return False
+          return True
+
         return (
             jnp.shape(x) == jnp.shape(y)
             and jnp.dtype(x) == jnp.dtype(y)
-            and x.sharding == y.sharding
+            and equivalent_sharding(x, y)
         )
 
       if not all(
@@ -274,9 +278,11 @@ class Sampler:
       self._transformer_state = state
     else:
       # LoRA state replacement.
-      assert (
-          len(param_types) == 1 and nnx.LoRAParam in param_types
-      ), f'Only LoRAParam is supported. Invalid: {param_types}'
+      if not (len(param_types) == 1 and nnx.LoRAParam in param_types):
+        raise ValueError(
+            'Only LoRAParam is supported. Received invalid `param_types`: '
+            f'{param_types}'
+        )
       original_lora_params = statelib.filter_state(
           self._transformer_state, nnx.LoRAParam
       )
@@ -328,14 +334,24 @@ class Sampler:
 
     done = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
-    cache = _init_cache(
-        n_layers=self.cache_config.num_layers,
-        cache_size=self.cache_config.cache_size,
-        batch_size=batch_size,
-        num_kv_heads=self.cache_config.num_kv_heads,
-        head_dim=self.cache_config.head_dim,
-        dtype=self.dtype,
-    )
+    if hasattr(self.transformer, 'init_cache'):
+      cache = self.transformer.init_cache(
+          batch_size, self.cache_config.cache_size, self.dtype
+      )
+    else:
+      warnings.warn(
+          'Using deprecated _init_cache in Tunix sampler. Models are now'
+          ' required to have their own init_cache attribute.',
+          DeprecationWarning,
+      )
+      cache = _init_cache(
+          n_layers=self.cache_config.num_layers,
+          cache_size=self.cache_config.cache_size,
+          batch_size=batch_size,
+          num_kv_heads=self.cache_config.num_kv_heads,
+          head_dim=self.cache_config.head_dim,
+          dtype=self.dtype,
+      )
 
     if include_logits:
       logits_buffer = jnp.zeros(
@@ -388,7 +404,7 @@ class Sampler:
   def _sample(
       self,
       logits: jnp.ndarray,
-      eos: int,
+      eos: jax.Array,
       cache: dict[str, dict[str, jaxtyping.Array]],
       sampler_state: _SamplingState,
   ) -> _SamplingState:
@@ -411,7 +427,7 @@ class Sampler:
           cache=cache,
           logits_buffer=logits_buffer,
           state=beam_search_state,
-          pad_token_id=eos,
+          pad_token_id=eos[0],
           decoding_step=decoding_step,
       )
       cache = updated_args['cache']
@@ -438,7 +454,7 @@ class Sampler:
           next_token_candidate
       )
 
-    done = done | jnp.equal(token_buffer[:, decoding_step + 1], eos)
+    done = done | jnp.isin(token_buffer[:, decoding_step + 1], eos)
     return _SamplingState(
         decoding_step=sampler_state.decoding_step + 1,
         num_input_tokens=sampler_state.num_input_tokens,
@@ -542,7 +558,7 @@ class Sampler:
     updated_sampler_state = self._sample(
         logits=logits,
         cache=cache,
-        eos=self.tokenizer.eos_id(),
+        eos=self.eos_ids,
         sampler_state=updated_sampling_state,
     )
     return updated_sampler_state
@@ -592,7 +608,7 @@ class Sampler:
     updated_sampler_state = self._sample(
         logits=logits,
         cache=cache,
-        eos=self.tokenizer.eos_id(),
+        eos=self.eos_ids,
         sampler_state=sampler_state,
     )
 
@@ -613,18 +629,19 @@ class Sampler:
   def __call__(
       self,
       input_strings: Sequence[str],
-      total_generation_steps: int,
+      max_generation_steps: int,
       max_prompt_length: int | None = None,
       echo: bool = False,
       return_logits: bool = False,
+      eos_tokens: Sequence[int] | None = None,
       forbidden_tokens: Sequence[str] | None = None,
       temperature: float = 0.0,
       top_p: Optional[float] = None,
       top_k: Optional[int] = None,
       beam_size: Optional[int] = None,
-      seed: jax.Array | None = None,
+      seed: int | None = None,
       pad_output: bool = False,
-  ) -> SamplerOutput:
+  ) -> base_sampler.SamplerOutput:
     """Samples a completion of the input string.
 
     If top_p is provided, the sampling mode will be top_p.
@@ -633,12 +650,14 @@ class Sampler:
 
     Args:
       input_strings: input prompts to feed to the model for sampling.
-      total_generation_steps: number of generation steps. will correspond to the
+      max_generation_steps: number of generation steps. will correspond to the
         longest prompt in the batch.
       max_prompt_length: maximum length of the prompt. Specify to avoid
         recompilation on different prompt lengths.
       echo: whgether to return the prompt as part of the output sample.
       return_logits: whether to return per-step logits used during generation.
+      eos_tokens: end of sequence tokens to stop generation. If None, the
+        tokenizer's eos_id will be used.
       forbidden_tokens: list of tokens that are forbidden to be generated. Each
         token must map to a single token id in the vocab.
       temperature: temperature for sampling.
@@ -647,14 +666,16 @@ class Sampler:
       beam_size: beam size for beam search.
       seed: random seed for sampling.
       pad_output: whether to pad the output to maximum length. If this set as
-        True, the output len will be total_generation_steps if echo is False,
-        otherwise it will be total_generation_steps + max_prompt_length. The
+        True, the output len will be max_generation_steps if echo is False,
+        otherwise it will be max_generation_steps + max_prompt_length. The
         padding now only supports right padding. Can modify to support left
         padding if needed.
 
     Returns:
       sampler_output: A SamplerOutput object containing the generated samples.
     """
+    self.eos_ids = jnp.array(eos_tokens or [self.tokenizer.eos_id()])
+
     forbidden_token_ids = None
     if forbidden_tokens is not None:
       forbidden_token_ids = []
@@ -671,6 +692,7 @@ class Sampler:
     max_tokens_length = max(len(x) for x in tokens)
     if max_prompt_length is None or max_prompt_length < max_tokens_length:
       max_prompt_length = utils.next_power_of_2(max_tokens_length)
+
     all_input_ids = jnp.array([
         utils.pad_to_length(
             x,
@@ -680,15 +702,18 @@ class Sampler:
         )
         for x in tokens
     ])
-    total_sampling_steps = max_prompt_length + total_generation_steps
+
+    total_sampling_steps = max_prompt_length + max_generation_steps
     if total_sampling_steps > self.cache_config.cache_size:
       raise ValueError(
-          'Total sampling steps must be less than the cache size'
-          f' {self.cache_config.cache_size}.'
+          f'Total sampling steps {total_sampling_steps} must be less than the'
+          f' cache size {self.cache_config.cache_size}.'
       )
 
     if seed is None:
       seed = jax.random.PRNGKey(0)
+    elif isinstance(seed, int):
+      seed = jax.random.PRNGKey(seed)
     sampling_state = self.init_sample_state(
         all_input_ids,
         include_logits=return_logits,
@@ -707,7 +732,6 @@ class Sampler:
     sampling_state = self._compiled_decode_fn(
         self._flattened_transformer_state, sampling_state
     )
-
     token_buffers = sampling_state.token_buffer
     logits_buffers = sampling_state.logits_buffer
 
@@ -724,14 +748,14 @@ class Sampler:
       # finalize_beam_search_state
       del sampling_state
     if pad_output:
-      max_len = total_sampling_steps if echo else total_generation_steps
+      max_len = total_sampling_steps if echo else max_generation_steps
       lengths, out_tokens, out_logits = utils.padded_fill_tokens_and_logits(
           token_buffers,
           logits_buffers,
           return_logits,
           echo,
           self.tokenizer.pad_id(),
-          self.tokenizer.eos_id(),
+          self.eos_ids,
           max_prompt_length,
           max_len,
       )
@@ -751,7 +775,7 @@ class Sampler:
         )
         end_idx = (
             utils.find_first_eos_idx(
-                token_buffer[max_prompt_length:], self.tokenizer.eos_id()
+                token_buffer[max_prompt_length:], self.eos_ids
             )
             + max_prompt_length
         )
@@ -764,10 +788,11 @@ class Sampler:
           self.tokenizer.decode(tokens.tolist()) for tokens in out_tokens
       ]
 
-    result = SamplerOutput(
+    result = base_sampler.SamplerOutput(
         text=decoded_outputs,
         logits=out_logits if return_logits else [],
         tokens=out_tokens,
         padded_prompt_tokens=all_input_ids,
+        logprobs=None,
     )
     return result

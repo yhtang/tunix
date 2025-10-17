@@ -15,13 +15,14 @@ class ProgressBar:
       metrics_logger: ml.MetricsLogger,
       initial_steps: int,
       max_steps: int,
+      description: str | None = None,
   ):
 
     # Initialise progress bar.
     self.tqdm_bar = tqdm(
         total=max_steps,
         initial=initial_steps,
-        desc="Training",
+        desc=description,
         unit="step",
         dynamic_ncols=True,
         leave=True,
@@ -36,23 +37,24 @@ class ProgressBar:
     self.initial_steps = initial_steps
     self.max_steps = max_steps
     self.metrics_logger = metrics_logger
+    self.description = description
+    self.disable_warning_for_metrics = {"learning_rate"}
 
   def _update_metric(self, metric_name: str, mode: ml.Mode, ndigits: int = 3):
     """Update metric corresponding to `metric_name`."""
 
     mode_str = str(mode)
-    if not self.metrics_logger.metric_exists(metric_name, mode):
+    if self.metrics_logger.metric_exists(metric_name, mode):
+      self.metrics[f"{mode_str}_{metric_name}"] = round(
+          self.metrics_logger.get_metric(metric_name, mode).item(),
+          ndigits,
+      )
+    elif metric_name not in self.disable_warning_for_metrics:
       logging.warning(
           "Metric %s not found for mode %s. Not logging metric.",
           metric_name,
           mode_str,
       )
-      return
-
-    self.metrics[f"{mode_str}_{metric_name}"] = round(
-        self.metrics_logger.get_metric(metric_name, mode).item(),
-        ndigits,
-    )
 
   def update_metrics(
       self, metric_names: list[str], mode: ml.Mode, ndigits: int = 3

@@ -19,6 +19,8 @@ This provides a mapping from the upstream checkpoints[1] to our implementation.
 [1] https://github.com/google-deepmind/gemma
 """
 
+import functools
+
 from etils import epath
 import flax
 from flax import nnx
@@ -26,14 +28,19 @@ import jax
 from jax import numpy as jnp
 from orbax import checkpoint as ocp
 from tunix.models.gemma3 import model as model_lib
-import sentencepiece as spm
+
+# Keep the import below for google internal lint.
+import sentencepiece as spm  # isort:skip  # pylint: disable=line-too-long
+
 
 # Pretrained
+GEMMA3_270M_PT = 'gs://gemma-data/checkpoints/gemma3-270m-pt'
 GEMMA3_1B_PT = 'gs://gemma-data/checkpoints/gemma3-1b-pt'
 GEMMA3_4B_PT = 'gs://gemma-data/checkpoints/gemma3-4b-pt'
 GEMMA3_12B_PT = 'gs://gemma-data/checkpoints/gemma3-12b-pt'
 GEMMA3_27B_PT = 'gs://gemma-data/checkpoints/gemma3-27b-pt'
 # Instruction Tuned
+GEMMA3_270M_IT = 'gs://gemma-data/checkpoints/gemma3-270m-it'
 GEMMA3_1B_IT = 'gs://gemma-data/checkpoints/gemma3-1b-it'
 GEMMA3_4B_IT = 'gs://gemma-data/checkpoints/gemma3-4b-it'
 GEMMA3_12B_IT = 'gs://gemma-data/checkpoints/gemma3-12b-it'
@@ -44,8 +51,9 @@ GEMMA3_TOKENIZER = 'gs://gemma-data/tokenizers/tokenizer_gemma3.model'
 
 def create_model_from_checkpoint(
     checkpoint_path: str,
-    model_config: model_lib.Gemma3Config,
+    model_config: model_lib.ModelConfig,
     mesh: jax.sharding.Mesh | None = None,
+    dtype: jnp.dtype = jnp.bfloat16,
 ) -> model_lib.Gemma3:
   """Load a Gemma3 model from a checkpoint."""
   abs_model = nnx.eval_shape(
@@ -55,12 +63,12 @@ def create_model_from_checkpoint(
   params = _map_from_upstream_checkpoint(params)
   if mesh is not None:
     params = jax.tree.map(
-        lambda x, shd: jnp.asarray(x, device=shd),
+        lambda x, shd: jnp.asarray(x, device=shd, dtype=dtype),
         params,
         nnx.to_pure_dict(nnx.get_named_sharding(nnx.state(abs_model), mesh)),
     )
   else:
-    params = jax.tree.map(jnp.asarray, params)
+    params = jax.tree.map(functools.partial(jnp.asarray, dtype=dtype), params)
   nnx.update(abs_model, params)
   return abs_model
 

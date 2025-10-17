@@ -2,12 +2,13 @@
 
 import collections
 import dataclasses
+import datetime
 import enum
 import functools
 import logging
 
 import jax
-from jax import numpy as jnp
+import numpy as np
 from tensorboardX import writer
 
 try:
@@ -23,6 +24,8 @@ _DEFAULT_STEP = 0
 
 @dataclasses.dataclass
 class MetricsLoggerOptions:
+  """Metrics Logger options."""
+
   log_dir: str
   flush_every_n_steps: int = 100
 
@@ -41,11 +44,16 @@ def _get_step(kwargs: dict[str, str | int]) -> int:
   return _DEFAULT_STEP if step is None else int(step)
 
 
+def _preprocess_event_name(event_name: str) -> str:
+  """Preprocesses the event name before logging."""
+  return event_name.lstrip("/")  # Remove leading slashes
+
+
 def log_to_tensorboard(
     summary_writer: writer.SummaryWriter,
     flush_every_n_steps: int,
     event: str,
-    scalar_value: float | jax.Array,
+    scalar_value: float | np.ndarray,
     **kwargs: str | int,
 ):
   """Creates a TensorBoard event listener for jax.monitoring.
@@ -63,6 +71,7 @@ def log_to_tensorboard(
     ValueError: If 'step' is not provided in `kwargs`.
   """
   current_step = _get_step(kwargs)
+  event = _preprocess_event_name(event)
   summary_writer.add_scalar(event, scalar_value, current_step)
   if current_step % flush_every_n_steps == 0:
     summary_writer.flush()
@@ -70,7 +79,7 @@ def log_to_tensorboard(
 
 def log_to_wandb(
     event: str,
-    scalar_value: float | jax.Array,
+    scalar_value: float | np.ndarray,
     **kwargs: str | int,
 ):
   """Creates a W&B event listener for jax.monitoring.
@@ -86,6 +95,7 @@ def log_to_wandb(
   current_step = _get_step(kwargs)
 
   if wandb is not None:
+    event = _preprocess_event_name(event)
     wandb.log({event: scalar_value}, step=current_step)
 
 
@@ -99,6 +109,9 @@ def register_jax_monitoring(metrics_logger_options: MetricsLoggerOptions):
     A list containing registered metric writers. Currently only returns a
     single TensorBoard Summary Writer instance.
   """
+  # Only register the writer on the main process to avoid race conditions.
+  if jax.process_index() != 0:
+    return []
   # Register TensorBoard backend.
   tensorboard_summary_writer = writer.SummaryWriter(
       logdir=metrics_logger_options.log_dir
@@ -112,42 +125,49 @@ def register_jax_monitoring(metrics_logger_options: MetricsLoggerOptions):
   )
   # Register Weights & Biases backend.
   if wandb is not None:
-    wandb.init(project="tunix", name="tunix_metrics_logger", anonymous="allow")
+    wandb_run_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    wandb.init(project="tunix", name=wandb_run_name, anonymous="allow")
+    if wandb.run:
+      logging.info("W&B run URL: %s", wandb.run.url)
     jax.monitoring.register_scalar_listener(log_to_wandb)
   return [tensorboard_summary_writer]
 
 
-def _calculate_geometric_mean(x: jax.Array) -> jax.Array:
+def _calculate_geometric_mean(x: np.ndarray) -> np.ndarray:
   """Calculates geometric mean of a batch of values."""
-  return jnp.exp(jnp.mean(jnp.log(x)))
+  return np.exp(np.mean(np.log(x)))
 
 
 class MetricsLogger:
   """Simple Metrics logger."""
 
   def __init__(
-      self, metrics_logger_options: MetricsLoggerOptions | None = None
+      self,
+      metrics_logger_options: MetricsLoggerOptions | None = None,
+      metric_prefix: str = "",
   ):
     self._metrics = {
         Mode.TRAIN: collections.defaultdict(list),
         Mode.EVAL: collections.defaultdict(list),
     }
+
+    self._summary_writers = None
     if metrics_logger_options:
       self._summary_writers = register_jax_monitoring(metrics_logger_options)
-    else:
-      self._summary_writers = None
+
+    self.metric_prefix = metric_prefix
 
   def log(
       self,
       metric_name: str,
-      scalar_value: float | jax.Array,
+      scalar_value: float | np.ndarray,
       mode: Mode | str,
       step: int,
   ):
     """Logs the scalar metric value for the given metric name and mode."""
     self._metrics[mode][metric_name].append(scalar_value)
     jax.monitoring.record_scalar(
-        f"{mode}/{metric_name}", scalar_value, step=step
+        f"{self.metric_prefix}{mode}/{metric_name}", scalar_value, step=step
     )
 
   def metric_exists(self, metric_name: str, mode: Mode | str) -> bool:
@@ -163,9 +183,9 @@ class MetricsLogger:
       )
     if metric_name == "perplexity":
       return _calculate_geometric_mean(
-          jnp.stack(self._metrics[mode][metric_name])
+          np.stack(self._metrics[mode][metric_name])
       )
-    return jnp.mean(jnp.stack(self._metrics[mode][metric_name]))
+    return np.mean(np.stack(self._metrics[mode][metric_name]))
 
   def get_metric_history(self, metric_name: str, mode: Mode | str):
     """Returns the all past metric values for the given metric name and mode."""
@@ -174,7 +194,7 @@ class MetricsLogger:
           f"Metric {metric_name} not found for mode {mode}. Available metrics"
           f" for mode {mode}: {self._metrics[mode].keys()}"
       )
-    return jnp.stack(self._metrics[mode][metric_name])
+    return np.stack(self._metrics[mode][metric_name])
 
   def close(self):
     """Closes the metrics logger."""

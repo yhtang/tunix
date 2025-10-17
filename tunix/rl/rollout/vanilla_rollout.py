@@ -14,28 +14,36 @@
 
 """Vanilla rollout worker with Tunix sampler."""
 
+import dataclasses
 import functools
 import operator
-from typing import Any
+from typing import Any, Optional, Tuple
+
 from flax import nnx
 import jax
+import jax.numpy as jnp
 import jaxtyping
 from tunix.generate import sampler
 from tunix.rl import common
-from tunix.rl.grpo import utils
+from tunix.rl import reshard
+from tunix.rl import utils
 from tunix.rl.rollout import base_rollout
 
 
 class VanillaRollout(base_rollout.BaseRollout):
   """Vanilla rollout worker."""
 
-  # TODO(tsbao): Remove cache_config from the constructor.
-  # Instead, we should just take in cache_size and have default config based on
-  # model.
   def __init__(
-      self, model: nnx.Module, tokenizer: Any, cache_config: sampler.CacheConfig
+      self,
+      model: nnx.Module,
+      tokenizer: Any,
+      cache_config_or_size: base_rollout.CacheConfig,
   ):
-    self._sampler = sampler.Sampler(model, tokenizer, cache_config)
+    self._sampler = sampler.Sampler(
+        model,
+        tokenizer,
+        sampler.CacheConfig(**dataclasses.asdict(cache_config_or_size)),
+    )
 
   def generate(
       self,
@@ -46,26 +54,29 @@ class VanillaRollout(base_rollout.BaseRollout):
     """Generates samples from the model."""
     output = self._sampler(
         input_strings=prompts,
-        total_generation_steps=rollout_config.max_tokens_to_generate,
-        max_prompt_length=kwargs.get('max_prompt_length', None),
+        max_generation_steps=rollout_config.max_tokens_to_generate,
+        max_prompt_length=rollout_config.max_prompt_length,
         echo=False,
         temperature=rollout_config.temperature,
         top_p=rollout_config.top_p,
         top_k=rollout_config.top_k,
         seed=rollout_config.seed,
         pad_output=True,
+        eos_tokens=rollout_config.eos_tokens,
     )
     return base_rollout.RolloutOutput(
         text=output.text,
         logits=output.logits,
         tokens=output.tokens,
         left_padded_prompt_tokens=output.padded_prompt_tokens,
+        logprobs=None,
     )
 
   def get_per_token_logps(
       self,
       prompt_tokens: jax.Array,
       completion_tokens: jax.Array,
+      completion_mask: jax.Array | None = None,
   ) -> jax.Array:
     """Returns per-token log probabilities from the rollout policy."""
     return common.compute_per_token_logps(
@@ -74,10 +85,30 @@ class VanillaRollout(base_rollout.BaseRollout):
         completion_tokens=completion_tokens,
         pad_id=self.pad_id(),
         eos_id=self.eos_id(),
-    )
+        completion_mask=completion_mask,
+    )[0]
 
-  def update_params(self, params: jaxtyping.PyTree) -> None:
-    flat_new_params, _ = utils.to_flat_dict(params)
+  def update_params(
+      self,
+      params: jaxtyping.PyTree,
+      filter_types: Optional[Tuple[Any, ...]] = None,
+  ) -> None:
+    if filter_types is not None:
+      dst_params = nnx.state(self.model(), filter_types)
+      resharded_params = reshard.reshard_pytree(params, dst_params)
+    else:
+      resharded_params = params
+    flat_new_params, _ = utils.to_flat_dict(resharded_params)
+    # TODO(linchai): Cast on rollout devices when from lower precision to
+    # higher precision.
+    new_params_precision = jax.tree.leaves(flat_new_params)[0].dtype
+    rollout_precision = jax.tree.leaves(self._sampler.transformer_state)[
+        0
+    ].dtype
+    if new_params_precision != rollout_precision:
+      flat_new_params = jax.tree.map(
+          lambda x: x.astype(rollout_precision), flat_new_params
+      )
     flat_old_params, tree_def = utils.to_flat_dict(
         self._sampler.transformer_state
     )

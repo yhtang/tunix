@@ -14,37 +14,38 @@
 
 """Inference worker for RL."""
 
-import enum
-from typing import List
 from flax import nnx
 import jax
+import jaxtyping
 from tunix.rl import common
-
-
-class ModelRole(enum.Enum):
-  """Role of the model."""
-
-  CRITIC = 0
-  REFERENCE = 1
-  REWARD = 2
-
-
-class ModelContainer:
-
-  def __init__(self, model: nnx.Module, role: ModelRole):
-    self.model = model
-    self.role = role
 
 
 class InferenceWorker:
   """Inference worker hosting critic, reference and reward models."""
 
-  def __init__(self, models: List[ModelContainer]):
-    self._model_map = {m.role: m.model for m in models}
+  def __init__(self, models: dict[str, nnx.Module]):
+    for k in models.keys():
+      if k not in ["critic", "reference", "reward"]:
+        raise ValueError(
+            f"Model role {k} is not supported. Supported models are critic,"
+            " reference and reward."
+        )
+    self._models = models
     # TODO(tsbao): support multiple reward models.
 
-  def compute_rewards(self):
-    raise NotImplementedError()
+  def get_rewards(
+      self,
+      prompt_tokens: jax.Array,
+      completion_tokens: jax.Array,
+      pad_id: int,
+      eos_id: int,
+  ) -> jax.Array:
+    reward_model = self._models.get("reward")
+    if reward_model is None:
+      raise ValueError("Reward model is not available.")
+    return common.compute_score(
+        reward_model, prompt_tokens, completion_tokens, pad_id, eos_id
+    )
 
   def get_ref_per_token_logps(
       self,
@@ -52,8 +53,9 @@ class InferenceWorker:
       completion_tokens: jax.Array,
       pad_id: int,
       eos_id: int,
-  ):
-    ref_model = self._model_map.get(ModelRole.REFERENCE)
+      completion_mask: jax.Array | None = None,
+  ) -> jax.Array:
+    ref_model = self._models.get("reference")
     if ref_model is None:
       raise ValueError("Reference model is not available.")
     return common.compute_per_token_logps(
@@ -62,7 +64,35 @@ class InferenceWorker:
         completion_tokens=completion_tokens,
         pad_id=pad_id,
         eos_id=eos_id,
+        completion_mask=completion_mask,
+    )[0]
+
+  def get_values(
+      self,
+      prompt_tokens: jax.Array,
+      completion_tokens: jax.Array,
+      pad_id: int,
+      eos_id: int,
+      completion_mask: jax.Array | None = None,
+  ) -> jax.Array:
+    critic_model = self._models.get("critic")
+    if critic_model is None:
+      raise ValueError("Critic model is not available.")
+    return common.compute_score(
+        critic_model,
+        prompt_tokens,
+        completion_tokens,
+        pad_id,
+        eos_id,
+        completion_mask=completion_mask,
     )
 
-  def compute_values(self):
-    raise NotImplementedError()
+  def get_model(self, role: str) -> nnx.Module:
+    if role not in self._models:
+      raise ValueError(f"Model role {role} is not available.")
+    return self._models[role]
+
+  def update_model(self, role: str, params: jaxtyping.PyTree):
+    if role not in self._models:
+      raise ValueError(f"Model role {role} is not available.")
+    nnx.update(self._models[role], params)

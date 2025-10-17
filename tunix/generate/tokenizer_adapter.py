@@ -17,6 +17,11 @@
 import enum
 import inspect
 from typing import Any
+
+from etils import epath
+import numpy as np
+import transformers
+
 import sentencepiece as spm
 
 
@@ -33,12 +38,13 @@ class TokenizerAdapter:
     self._tokenizer = tokenizer
 
     missing_methods = self._missing_methods()
-    if not missing_methods:
-      self._tokenizer_type = TokenizerType.NONE
-    elif isinstance(self._tokenizer, spm.SentencePieceProcessor):
+
+    if isinstance(self._tokenizer, spm.SentencePieceProcessor):
       self._tokenizer_type = TokenizerType.SP
     elif self._is_hf_tokenizer():
       self._tokenizer_type = TokenizerType.HF
+    elif not missing_methods:
+      self._tokenizer_type = TokenizerType.NONE
     else:
       raise ValueError(
           'Your tokenizer should either be a `spm.SentencePieceProcessor` '
@@ -49,21 +55,21 @@ class TokenizerAdapter:
           f'{missing_methods}.'
       )
 
-  def encode(self, text: str) -> list[int]:
+  def encode(self, text: str, **kwargs) -> list[int]:
     if self._tokenizer_type == TokenizerType.SP:
-      return self._tokenizer.EncodeAsIds(text)
+      return self._tokenizer.EncodeAsIds(text, **kwargs)
     elif self._tokenizer_type == TokenizerType.HF:
-      return self._tokenizer.encode(text)
+      return self._tokenizer.encode(text, **kwargs)
     else:
-      return self._tokenizer.encode(text)
+      return self._tokenizer.encode(text, **kwargs)
 
-  def decode(self, ids: list[int]) -> str:
+  def decode(self, ids: list[int], **kwargs) -> str:
     if self._tokenizer_type == TokenizerType.SP:
-      return self._tokenizer.DecodeIds(ids)
+      return self._tokenizer.DecodeIds(ids, **kwargs)
     elif self._tokenizer_type == TokenizerType.HF:
-      return self._tokenizer.decode(ids)
+      return self._tokenizer.decode(ids, **kwargs)
     else:
-      return self._tokenizer.decode(ids)
+      return self._tokenizer.decode(ids, **kwargs)
 
   def bos_id(self) -> int:
     if self._tokenizer_type == TokenizerType.SP:
@@ -82,9 +88,16 @@ class TokenizerAdapter:
       return self._tokenizer.eos_id()
 
   def pad_id(self) -> int:
+    """Returns the pad token id."""
     if self._tokenizer_type == TokenizerType.SP:
-      return self._tokenizer.pad_id()
+      ret_id = self._tokenizer.pad_id()
+      if ret_id == -1:
+        raise ValueError('SentencePiece tokenizer has a undefined pad_id.')
+      return ret_id
     elif self._tokenizer_type == TokenizerType.HF:
+      # e.g. llama3 HF tokenizers do not have pad_id
+      if self._tokenizer.pad_token_id is None:
+        self._tokenizer.pad_token = self._tokenizer.eos_token
       return self._tokenizer.pad_token_id
     else:
       return self._tokenizer.pad_id()
@@ -111,3 +124,147 @@ class TokenizerAdapter:
     ):
       return True
     return False
+
+  @property
+  def tokenizer(self) -> Any:
+    return self._tokenizer
+
+
+class Tokenizer(TokenizerAdapter):
+  """Tokenizing and encoding/decoding text using TokenizerAdapter."""
+
+  def __init__(
+      self,
+      tokenizer_type: str = 'sentencepiece',
+      tokenizer_path: str = 'gs://gemma-data/tokenizers/tokenizer_gemma2.model',
+      add_bos: bool | None = True,
+      add_eos: bool | None = True,
+      hf_access_token: str | None = None,
+  ):
+
+    self.tokenizer_type = tokenizer_type
+    if tokenizer_type == 'huggingface':
+      tokenizer = transformers.AutoTokenizer.from_pretrained(
+          pretrained_model_name_or_path=tokenizer_path,
+          add_bos_token=add_bos,
+          add_eos_token=add_eos,
+          token=hf_access_token,
+      )
+    elif tokenizer_type == 'sentencepiece':
+      model_proto = epath.Path(tokenizer_path).read_bytes()
+      tokenizer = spm.SentencePieceProcessor()
+      tokenizer.LoadFromSerializedProto(model_proto)
+      options = []
+      if add_bos:
+        options.append('bos')
+      if add_eos:
+        options.append('eos')
+
+      extra_options_str = ':'.join(options)
+      if extra_options_str:
+        tokenizer.SetEncodeExtraOptions(extra_options_str)
+    else:
+      raise ValueError(f'Unsupported tokenizer_type: {tokenizer_type}')
+    super().__init__(tokenizer)
+
+  def apply_chat_template(
+      self,
+      messages: list[dict[str, str]],
+      add_generation_prompt: bool = True,
+      tokenize: bool = False,
+      **kwargs,
+  ) -> str | list[int]:
+    """Applies a chat template to format a list of messages.
+
+    Primarily for HuggingFace tokenizers, this formats conversation history
+    into a single string or token sequence.
+
+    Args:
+      messages: Conversation turns, each with 'role' and 'content'.
+      add_generation_prompt: Whether to append a generation prompt.
+      tokenize: If True, returns token IDs; otherwise, returns a string.
+      **kwargs: Additional args for the underlying `apply_chat_template`.
+
+    Returns:
+      The formatted chat as a string or list of token IDs.
+
+    Raises:
+      NotImplementedError: If chat templating is not supported by the tokenizer.
+    """
+    if self._tokenizer_type == TokenizerType.HF:
+      return self._tokenizer.apply_chat_template(
+          messages,
+          add_generation_prompt=add_generation_prompt,
+          tokenize=tokenize,
+          **kwargs,
+      )
+    elif self._tokenizer_type == TokenizerType.SP:
+      return self._apply_gemma_chat_template(
+          messages, add_generation_prompt, tokenize
+      )
+    else:
+      if hasattr(self._tokenizer, 'apply_chat_template'):
+        return self._tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=tokenize,
+            **kwargs,
+        )
+      # Implements the Gemma chat template format as a fallback.
+      return self._apply_gemma_chat_template(
+          messages, add_generation_prompt, tokenize
+      )
+
+  def _apply_gemma_chat_template(
+      self,
+      messages: list[dict[str, str]],
+      add_generation_prompt: bool,
+      tokenize: bool,
+  ) -> str | list[int]:
+    """Applies the Gemma chat template format."""
+    chat_str = ''
+    for message in messages:
+      role = message.get('role')
+      content = message.get('content')
+      if role in ('user', 'model'):
+        chat_str += f'<start_of_turn>{role}\n{content}<end_of_turn>\n'
+
+    if add_generation_prompt:
+      chat_str += '<start_of_turn>model\n'
+
+    if tokenize:
+      return self.encode(chat_str)
+    return chat_str
+
+  def tokenize(
+      self,
+      example: str,
+      prefix: str = '',
+      suffix: str = '',
+      add_eos: bool = True,
+  ) -> np.ndarray:
+    """The tokenization function.
+
+    Args:
+      example: Input string to tokenize.
+      prefix:  Prefix to add to the input string.
+      suffix:  Suffix to add to the input string.
+      add_eos: If True, add an "end of sentence" token at the end of the output
+        sequence.
+
+    Returns:
+      Tokens corresponding to the input string.
+    """
+    int_list = []
+    if self.bos_id():
+      int_list.append(self.bos_id())
+    if self.tokenizer_type == 'huggingface':
+      int_list.extend(
+          self.encode(prefix + example + suffix, add_special_tokens=False)
+      )
+    else:
+      # sentencepiece
+      int_list.extend(self.tokenizer.EncodeAsIds(prefix + example + suffix))
+    if add_eos:
+      int_list.append(self.eos_id())
+    return np.array(int_list, dtype=np.int32)

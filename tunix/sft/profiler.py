@@ -15,6 +15,7 @@
 """Profiler class for Tunix trainers."""
 
 import dataclasses
+
 from absl import logging
 import jax
 
@@ -27,6 +28,12 @@ class ProfilerOptions:
   skip_first_n_steps: int
   # Number of steps to profile.
   profiler_steps: int
+  # Whether to set the profile options.
+  set_profile_options: bool = True
+  # https://github.com/jax-ml/jax/blob/0b1b909dd66a113ee0d7e54e55d0efef480e2a8a/docs/profiling.md?plain=1#L285
+  host_tracer_level: int = 2  # set to 2 to capture HBM profiles.
+  # https://github.com/jax-ml/jax/blob/0b1b909dd66a113ee0d7e54e55d0efef480e2a8a/docs/profiling.md?plain=1#L300
+  python_tracer_level: int = 1
 
 
 class Profiler:
@@ -41,21 +48,42 @@ class Profiler:
     if jax.process_index() != 0 or profiler_options is None:
       self._do_not_profile = True
       return
+    self._profiler_options = profiler_options
     self._do_not_profile = False
     self._output_path = profiler_options.log_dir
+    # This is step number, starting from 0.
     self._first_profile_step = (
         initial_step + profiler_options.skip_first_n_steps
     )
+    # This is step number + 1, starting from 1.
     self._last_profile_step = self._set_last_profile_step(
         profiler_options.profiler_steps, max_step
     )
+    # We use >= instead of > because last_profile_step is step number + 1.
+    if self._first_profile_step >= self._last_profile_step:
+      raise ValueError(
+          f"First profile step {self._first_profile_step} cannot be greater"
+          f" than the last profile step {self._last_profile_step}."
+      )
 
   def maybe_activate(self, step: int):
     """Start the profiler."""
     if self._do_not_profile or step != self._first_profile_step:
       return
     logging.info("Starting JAX profiler at step %d.", step)
-    jax.profiler.start_trace(self._output_path)
+    if self._profiler_options.set_profile_options:
+      profile_options = jax.profiler.ProfileOptions()
+      profile_options.host_tracer_level = (
+          self._profiler_options.host_tracer_level
+      )
+      profile_options.python_tracer_level = (
+          self._profiler_options.python_tracer_level
+      )
+      jax.profiler.start_trace(
+          log_dir=self._output_path, profiler_options=profile_options
+      )
+    else:
+      jax.profiler.start_trace(log_dir=self._output_path)
 
   def maybe_deactivate(self, step: int):
     """End the profiler."""

@@ -19,13 +19,17 @@ from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 from tunix.sft import profiler
+import tempfile
 
 
 class ProfilerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.log_dir = self.create_tempdir().full_path
+    try:
+      self.log_dir = self.create_tempdir().full_path
+    except Exception:
+      self.log_dir = tempfile.TemporaryDirectory().name
 
   @mock.patch('jax.process_index', return_value=0)
   @mock.patch('jax.profiler.start_trace')
@@ -46,7 +50,9 @@ class ProfilerTest(parameterized.TestCase):
     self.assertEqual(p._last_profile_step, 15)
 
     p.maybe_activate(10)  # Activate at the correct step
-    mock_start_trace.assert_called_once_with(self.log_dir)
+    mock_start_trace.assert_called_once_with(
+        log_dir=self.log_dir, profiler_options=mock.ANY
+    )
 
     p.maybe_deactivate(15)  # Deactivate at the correct step
     mock_stop_trace.assert_called_once()
@@ -149,7 +155,9 @@ class ProfilerTest(parameterized.TestCase):
     )
     p.maybe_activate(current_step)
     if expect_start_called:
-      mock_start_trace.assert_called_once_with(self.log_dir)
+      mock_start_trace.assert_called_once_with(
+          log_dir=self.log_dir, profiler_options=mock.ANY
+      )
     else:
       mock_start_trace.assert_not_called()
 
@@ -218,6 +226,51 @@ class ProfilerTest(parameterized.TestCase):
       mock_stop_trace.assert_called_once()
     else:
       mock_stop_trace.assert_not_called()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='first_5_last_10_max_1',
+          max_step=1,
+          initial_step=0,
+          skip_first_n_steps=5,
+          profiler_steps=5,
+      ),
+      dict(
+          testcase_name='first_1_last_1_max_1',
+          max_step=1,
+          initial_step=0,
+          skip_first_n_steps=1,
+          profiler_steps=0,
+      ),
+      dict(
+          testcase_name='first_1_last_2_max_1',
+          max_step=1,
+          initial_step=0,
+          skip_first_n_steps=1,
+          profiler_steps=1,
+      ),
+      dict(
+          testcase_name='first_1_last_1_max_10',
+          max_step=10,
+          initial_step=0,
+          skip_first_n_steps=1,
+          profiler_steps=0,
+      ),
+  )
+  def test_invalid_step_numbers(
+      self, max_step, initial_step, skip_first_n_steps, profiler_steps
+  ):
+    profiler_options = profiler.ProfilerOptions(
+        log_dir=self.log_dir,
+        skip_first_n_steps=skip_first_n_steps,
+        profiler_steps=profiler_steps,
+    )
+    with self.assertRaises(ValueError):
+      profiler.Profiler(
+          initial_step=initial_step,
+          max_step=max_step,
+          profiler_options=profiler_options,
+      )
 
 
 if __name__ == '__main__':

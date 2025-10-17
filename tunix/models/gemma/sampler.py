@@ -13,9 +13,11 @@ from flax.nnx import graph
 from flax.nnx import statelib
 import jax
 import jax.numpy as jnp
-from tunix.models.gemma import gemma as gemma_lib
+from tunix.models.gemma import model as gemma_lib
+from tunix.sft import utils
 
-import sentencepiece as spm
+# Keep the import below for google internal lint.
+import sentencepiece as spm  # isort:skip  # pylint: disable=line-too-long
 
 
 def _sample_top_p(
@@ -127,13 +129,16 @@ class SamplerOutput:
   text: list[str]
 
   # Per-step logits used during sampling.
-  logits: list[jax.Array]
+  logits: Optional[list[jax.Array]]
 
   # Tokens corresponding to the generated samples.
   tokens: list[jax.Array]
 
   # Left padded prompt tokens.
   padded_prompt_tokens: jax.Array
+
+  # Per-step log probs for output tokens
+  logprobs: Optional[list[float]]
 
 
 class Sampler:
@@ -223,9 +228,11 @@ class Sampler:
       self._transformer_state = state
     else:
       # LoRA state replacement.
-      assert (
-          len(param_types) == 1 and nnx.LoRAParam in param_types
-      ), f'Only LoRAParam is supported. Invalid: {param_types}'
+      if not (len(param_types) == 1 and nnx.LoRAParam in param_types):
+        raise ValueError(
+            'Only LoRAParam is supported. Received invalid `param_types`: '
+            f'{param_types}'
+        )
       original_lora_params = statelib.filter_state(
           self._transformer_state, nnx.LoRAParam
       )
@@ -273,7 +280,7 @@ class Sampler:
     input_mask = input_mask.at[:, :num_input_tokens].set(
         all_input_ids != self.vocab.pad_id()
     )
-    positions = gemma_lib.build_positions_from_mask(input_mask)
+    positions = utils.build_positions_from_mask(input_mask)
 
     done = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
@@ -506,7 +513,7 @@ class Sampler:
   def __call__(
       self,
       input_strings: Sequence[str],
-      total_generation_steps: int,
+      max_generation_steps: int,
       max_prompt_length: int | None = None,
       echo: bool = False,
       return_logits: bool = False,
@@ -514,13 +521,13 @@ class Sampler:
       temperature: float = 0.0,
       top_p: float = 0.95,
       top_k: int | None = None,
-      seed: jax.Array | None = None,
+      seed: int | None = None,
   ) -> SamplerOutput:
     """Samples a completion of the input string.
 
     Args:
       input_strings: input prompts to feed to the model for sampling.
-      total_generation_steps: number of generation steps. will correspond to the
+      max_generation_steps: number of generation steps. will correspond to the
         longest prompt in the batch.
       max_prompt_length: maximum length of the prompt. Specify to avoid
         recompilation on different prompt lengths.
@@ -561,10 +568,12 @@ class Sampler:
         )
         for x in tokens
     ])
-    total_sampling_steps = max_prompt_length + total_generation_steps
+    total_sampling_steps = max_prompt_length + max_generation_steps
 
     if seed is None:
       seed = jax.random.PRNGKey(0)
+    elif isinstance(seed, int):
+      seed = jax.random.PRNGKey(seed)
     sampling_state = self.init_sample_state(
         all_input_ids,
         include_logits=return_logits,
@@ -609,6 +618,7 @@ class Sampler:
         logits=out_logits,
         tokens=out_tokens,
         padded_prompt_tokens=all_input_ids,
+        logprobs=None,
     )
     return result
 

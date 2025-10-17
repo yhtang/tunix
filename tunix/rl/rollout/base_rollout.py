@@ -16,9 +16,21 @@
 
 import abc
 import dataclasses
-from typing import Any
+from typing import Any, Optional, Tuple
+
 import jax
+from jax import numpy as jnp
 import jaxtyping
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheConfig:
+  """Configuration for the KV cache."""
+
+  cache_size: int
+  num_layers: int
+  num_kv_heads: int
+  head_dim: int
 
 
 @dataclasses.dataclass
@@ -39,6 +51,9 @@ class RolloutOutput:
   # field, or add prompt + generated as extra.
   left_padded_prompt_tokens: jax.Array
 
+  # The log probs from sampler generations.
+  logprobs: list[float] | None
+
 
 @dataclasses.dataclass
 class RolloutConfig:
@@ -48,20 +63,17 @@ class RolloutConfig:
   https://docs.vllm.ai/en/v0.6.4/dev/sampling_params.html
   """
 
-  # Number of output sequences to return for the given prompt.
-  n: int = 1
-
   # Maximum number of tokens to generate per output sequence
   max_tokens_to_generate: int = 64
 
   # Float that controls the randomness of the sampling.
   # Lower values make the model more deterministic, while higher values make the
   # model more random. Zero means greedy sampling.
-  temperature: float = 0.0
+  temperature: float = 0.9
 
   # Float that controls the cumulative probability of the top tokens to
   # consider. Must be in (0, 1]. Set to 1 to consider all tokens.
-  top_p: float | None = None
+  top_p: float | None = 1.0
 
   # Integer that controls the number of top tokens to consider. Set to -1 to
   # consider all tokens.
@@ -69,6 +81,20 @@ class RolloutConfig:
 
   # Random seed to use for the generation.
   seed: jax.Array | None = None
+
+  # Maximum length of the prompt. The prompt will be padded/truncated to this
+  # length.
+  max_prompt_length: int = 64
+
+  # Only used for vanilla rollout engine.
+  kv_cache_size: int = 1024  # Only used for vanilla rollout engine.
+
+  # data type of the rollout model.
+  data_type: jnp.dtype | None = None
+
+  # EOS tokens to stop the generation. If not defined, eos_id from tokenizer
+  # will be used.
+  eos_tokens: list[int] | None = None
 
 
 class BaseRollout(abc.ABC):
@@ -88,11 +114,16 @@ class BaseRollout(abc.ABC):
       self,
       prompt_tokens: jax.Array,
       completion_tokens: jax.Array,
+      completion_mask: jax.Array | None = None,
   ) -> jax.Array:
     """Returns per-token log probabilities from the model."""
 
   @abc.abstractmethod
-  def update_params(self, params: jaxtyping.PyTree) -> None:
+  def update_params(
+      self,
+      params: jaxtyping.PyTree,
+      filter_types: Optional[Tuple[Any, ...]] = None,
+  ) -> None:
     """Updates the rollout model parameters."""
 
   @abc.abstractmethod
