@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Iterable, List, Sequence
 
+import contextlib
 import flax
 import jax
 import jax.numpy as jnp
