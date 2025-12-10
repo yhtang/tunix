@@ -203,6 +203,10 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       probabilities from the reference and policy models.
     """
     training_input["prompts"] = list(training_input["prompts"])
+    print(
+      f'Process {jax.process_index()}: {len(training_input["prompts"])} prompts '
+      f'{[hash(prompt) for prompt in training_input["prompts"]]}'
+    )
     pad_value = self.rl_cluster.rollout.pad_id()
     eos_value = self.rl_cluster.rollout.eos_id()
     rollout_output = self.rl_cluster.generate(
