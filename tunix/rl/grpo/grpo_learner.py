@@ -203,10 +203,15 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       probabilities from the reference and policy models.
     """
     training_input["prompts"] = list(training_input["prompts"])
-    print(
-      f'Process {jax.process_index()}: {len(training_input["prompts"])} prompts '
-      f'{[hash(prompt) for prompt in training_input["prompts"]]}'
-    )
+    for i, prompt in enumerate(training_input["prompts"]):
+      n = len(prompt)
+      if n > 64:
+        prompt_peek = prompt[:16] + "..." + prompt[(n//2):(n//2+32)] + "..." + prompt[-16:]
+      else:
+        prompt_peek = prompt      
+      print(
+        f'Process {jax.process_index()}: micro batch sample {i}/{len(training_input["prompts"])}: {prompt_peek}'
+      )
     pad_value = self.rl_cluster.rollout.pad_id()
     eos_value = self.rl_cluster.rollout.eos_id()
     rollout_output = self.rl_cluster.generate(
