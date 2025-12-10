@@ -132,6 +132,31 @@ class RLLearner(abc.ABC, Generic[TConfig]):
     )
     sft_utils.show_hbm_usage(title="RLLearner init")
 
+    # Effective per-process sizes (populated in train()).
+    self._local_rollout_micro_batch_size: int | None = None
+    self._local_compute_logps_micro_batch_size: int | None = None
+    self._local_train_micro_batch_size: int | None = None
+    self._local_mini_batch_size: int | None = None
+    self._service_target_batch_size: int | None = None
+
+  @property
+  def rollout_micro_batch_size(self) -> int:
+    if self._local_rollout_micro_batch_size is None:
+      raise RuntimeError(
+          "rollout_micro_batch_size is not initialized yet. It is set in "
+          "train() after local sizes are computed."
+      )
+    return self._local_rollout_micro_batch_size
+
+  @property
+  def compute_logps_micro_batch_size(self) -> int:
+    if self._local_compute_logps_micro_batch_size is None:
+      raise RuntimeError(
+          "compute_logps_micro_batch_size is not initialized yet. It is set in "
+          "train() after local sizes are computed."
+      )
+    return self._local_compute_logps_micro_batch_size
+
   @abstractmethod
   def _generate_and_compute_advantage(
       self,
@@ -570,6 +595,11 @@ class RLLearner(abc.ABC, Generic[TConfig]):
         (local_mini_batch_size, f"{local_mini_batch_size=}"),
     ]:
       rl_utils.check_divisibility(v, local_batch_size, n, f"{local_batch_size=}")
+    # Persist effective per-process sizes for subclasses.
+    self._local_mini_batch_size = local_mini_batch_size
+    self._local_train_micro_batch_size = local_train_micro_batch_size
+    self._local_rollout_micro_batch_size = local_rollout_micro_batch_size
+    self._local_compute_logps_micro_batch_size = local_compute_logps_micro_batch_size
     grad_acc_steps = self._training_config.get_with_default(
         "gradient_accumulation_steps", 1
     )
@@ -596,6 +626,7 @@ class RLLearner(abc.ABC, Generic[TConfig]):
         local_rollout_micro_batch_size,
         local_compute_logps_micro_batch_size,
     )
+    self._service_target_batch_size = service_target_batch_size
 
     # if the micro batch size is the same as the full batch size, we can use the
     # full batch iterator directly.
