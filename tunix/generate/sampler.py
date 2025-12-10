@@ -765,6 +765,8 @@ class Sampler(base_sampler.BaseSampler):
           max_len,
       )
       # Decode from local shards only (multi-controller safe)
+      print(f'XXXXXXXXXXXX [{jax.process_index()}/{jax.process_count()}]: out_tokens: shape {out_tokens.shape}, dtype {out_tokens.dtype}, sharding {out_tokens.sharding if hasattr(out_tokens, 'sharding') else "None"}')
+      print(f'XXXXXXXXXXXX [{jax.process_index()}/{jax.process_count()}]: lengths: shape {lengths.shape}, dtype {lengths.dtype}, sharding {lengths.sharding if hasattr(lengths, 'sharding') else "None"}')
       if not out_tokens.is_fully_addressable:
         tokens_host = np.concatenate([s.data for s in out_tokens.addressable_shards])
         lengths_host = np.concatenate([s.data for s in lengths.addressable_shards])
