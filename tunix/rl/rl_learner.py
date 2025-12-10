@@ -132,12 +132,9 @@ class RLLearner(abc.ABC, Generic[TConfig]):
     )
     sft_utils.show_hbm_usage(title="RLLearner init")
 
-    # Effective per-process sizes (populated in train()).
+    # per-process sizes to be populated in .train()
     self._local_rollout_micro_batch_size: int | None = None
     self._local_compute_logps_micro_batch_size: int | None = None
-    self._local_train_micro_batch_size: int | None = None
-    self._local_mini_batch_size: int | None = None
-    self._service_target_batch_size: int | None = None
 
   @property
   def rollout_micro_batch_size(self) -> int:
@@ -596,8 +593,6 @@ class RLLearner(abc.ABC, Generic[TConfig]):
     ]:
       rl_utils.check_divisibility(v, local_batch_size, n, f"{local_batch_size=}")
     # Persist effective per-process sizes for subclasses.
-    self._local_mini_batch_size = local_mini_batch_size
-    self._local_train_micro_batch_size = local_train_micro_batch_size
     self._local_rollout_micro_batch_size = local_rollout_micro_batch_size
     self._local_compute_logps_micro_batch_size = local_compute_logps_micro_batch_size
     grad_acc_steps = self._training_config.get_with_default(
@@ -626,7 +621,6 @@ class RLLearner(abc.ABC, Generic[TConfig]):
         local_rollout_micro_batch_size,
         local_compute_logps_micro_batch_size,
     )
-    self._service_target_batch_size = service_target_batch_size
 
     # if the micro batch size is the same as the full batch size, we can use the
     # full batch iterator directly.
