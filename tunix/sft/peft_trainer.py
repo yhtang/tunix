@@ -612,14 +612,6 @@ class PeftTrainer:
             break
 
           train_example = self._prepare_inputs(train_example)
-          # print every attribute in train_example and their shapes, dtype, and sharding info
-          print('ZZZZZZZZZZZZZZZ train_example:\n', train_example)
-          for k in ['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'advantages', 'ref_per_token_logps', 'old_per_token_logps']:
-            v = getattr(train_example, k)
-            if v is not None:
-              print(f"[{jax.process_index()}/{jax.process_count()}]: {k}: {v.shape}, {v.dtype}, {v.sharding if hasattr(v, 'sharding') else 'None'}")
-            else:
-              print(f"[{jax.process_index()}/{jax.process_count()}]: {k}: {v}")
           train_example = sharding_utils.shard_input(
               train_example, self.config.data_sharding_axis
           )

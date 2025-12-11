@@ -810,9 +810,7 @@ class Sampler(base_sampler.BaseSampler):
           max_prompt_length,
           max_len,
       )
-      # Decode from a single local device shard when the array is replicated across TP.
-      print(f'XXXXXXXXXXXX [{jax.process_index()}/{jax.process_count()}]: out_tokens: shape {out_tokens.shape}, dtype {out_tokens.dtype}, sharding {out_tokens.sharding if hasattr(out_tokens, 'sharding') else "None"}')
-      print(f'XXXXXXXXXXXX [{jax.process_index()}/{jax.process_count()}]: lengths: shape {lengths.shape}, dtype {lengths.dtype}, sharding {lengths.sharding if hasattr(lengths, 'sharding') else "None"}')
+      # Decode from local shards only (multi-controller safe)
       if not out_tokens.is_fully_addressable:
         _assert_tp_replicated(out_tokens)
         _assert_tp_replicated(lengths)
