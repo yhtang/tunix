@@ -39,9 +39,23 @@ from tunix.generate import utils
 import tunix.generate.beam_search as beam_search_lib
 import tunix.generate.tokenizer_adapter as tok_adapter
 from tunix.sft import sharding_utils as shd_utils
+from typing import Any as _TypingAny  # for helper typing isolation
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
+
+
+def _assert_tp_replicated(arr: _TypingAny) -> None:
+  """Assert that a global array is replicated across tensor-parallel axis.
+
+  This checks that the sharding spec does not include the 'tp' axis.
+  If the array does not have a NamedSharding/spec, the check is skipped.
+  """
+  sh = getattr(arr, 'sharding', None)
+  spec = getattr(sh, 'spec', None)
+  if spec is None:
+    return
+  assert 'tp' not in spec, f'Expected TP-replicated array; got spec={spec}'
 
 
 @flax.struct.dataclass
@@ -781,7 +795,7 @@ class Sampler(base_sampler.BaseSampler):
       del sampling_state
     
     print(f'BBBBBBBBBBBBBBB [{jax.process_index()}/{jax.process_count()}]: token_buffers: shape {token_buffers.shape}, dtype {token_buffers.dtype}, sharding {token_buffers.sharding if hasattr(token_buffers, 'sharding') else "None"}')
-    if logits_buffers:
+    if logits_buffers is not None:
       print(f'BBBBBBBBBBBBBBB [{jax.process_index()}/{jax.process_count()}]: logits_buffers: shape {logits_buffers.shape}, dtype {logits_buffers.dtype}, sharding {logits_buffers.sharding if hasattr(logits_buffers, 'sharding') else "None"}')
     
     if pad_output:
@@ -796,11 +810,12 @@ class Sampler(base_sampler.BaseSampler):
           max_prompt_length,
           max_len,
       )
-      # Decode from local shards only (multi-controller safe)
+      # Decode from a single local device shard when the array is replicated across TP.
       print(f'XXXXXXXXXXXX [{jax.process_index()}/{jax.process_count()}]: out_tokens: shape {out_tokens.shape}, dtype {out_tokens.dtype}, sharding {out_tokens.sharding if hasattr(out_tokens, 'sharding') else "None"}')
       print(f'XXXXXXXXXXXX [{jax.process_index()}/{jax.process_count()}]: lengths: shape {lengths.shape}, dtype {lengths.dtype}, sharding {lengths.sharding if hasattr(lengths, 'sharding') else "None"}')
       if not out_tokens.is_fully_addressable:
-        # Arrays are replicated across tp; shards are duplicates. Pick one.
+        _assert_tp_replicated(out_tokens)
+        _assert_tp_replicated(lengths)
         tokens_host = out_tokens.addressable_shards[0].data
         lengths_host = lengths.addressable_shards[0].data
       else:
@@ -812,14 +827,15 @@ class Sampler(base_sampler.BaseSampler):
           for i in range(len(tokens_host))
       ]
     else:
-      # Gather one local shard to host for processing; avoid per-row loops over global arrays.
+      # Gather a single local device shard for processing; avoid iterating global arrays.
       if hasattr(token_buffers, 'is_fully_addressable') and not token_buffers.is_fully_addressable:
+        _assert_tp_replicated(token_buffers)
         token_buffers_host = token_buffers.addressable_shards[0].data
-        logits_buffers_host = (
-            None
-            if logits_buffers is None
-            else logits_buffers.addressable_shards[0].data
-        )
+        if logits_buffers is None:
+          logits_buffers_host = None
+        else:
+          _assert_tp_replicated(logits_buffers)
+          logits_buffers_host = logits_buffers.addressable_shards[0].data
       else:
         token_buffers_host = jax.device_get(token_buffers)
         logits_buffers_host = (
