@@ -318,7 +318,7 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       )
       self.rl_cluster.buffer_metrics(user_defined_metric, mode=mode)
 
-    return TrainExample(
+    train_ex = TrainExample(
         prompt_ids=prompt_ids,
         prompt_mask=prompt_mask,
         completion_ids=completion_ids,
@@ -327,6 +327,12 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
         advantages=advantages,
         old_per_token_logps=old_per_token_logps,
     )
+    # Shard TrainExample leaves along fsdp to align with data-parallel mental model.
+    train_ex = sharding_utils.shard_input(
+        train_ex,
+        self.rl_cluster.cluster_config.training_config.data_sharding_axis,
+    )
+    return train_ex
 
   def _compute_trajectory_ids(
       self, example: TrainingInputT, steps: int
