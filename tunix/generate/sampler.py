@@ -733,7 +733,6 @@ class Sampler(base_sampler.BaseSampler):
         )
         for x in tokens
     ])
-    print(f'AAAAAAAAAAAAA [{jax.process_index()}/{jax.process_count()}]: all_input_ids: shape {all_input_ids.shape}, dtype {all_input_ids.dtype}, sharding {all_input_ids.sharding if hasattr(all_input_ids, 'sharding') else "None"}')
 
     total_sampling_steps = max_prompt_length + max_generation_steps
     if total_sampling_steps > self.cache_config.cache_size:
@@ -793,11 +792,6 @@ class Sampler(base_sampler.BaseSampler):
       # if need more internal states, they should be updated by
       # finalize_beam_search_state
       del sampling_state
-    
-    print(f'BBBBBBBBBBBBBBB [{jax.process_index()}/{jax.process_count()}]: token_buffers: shape {token_buffers.shape}, dtype {token_buffers.dtype}, sharding {token_buffers.sharding if hasattr(token_buffers, 'sharding') else "None"}')
-    if logits_buffers is not None:
-      print(f'BBBBBBBBBBBBBBB [{jax.process_index()}/{jax.process_count()}]: logits_buffers: shape {logits_buffers.shape}, dtype {logits_buffers.dtype}, sharding {logits_buffers.sharding if hasattr(logits_buffers, 'sharding') else "None"}')
-    
     if pad_output:
       max_len = total_sampling_steps if echo else max_generation_steps
       lengths, out_tokens, out_logits = utils.padded_fill_tokens_and_logits(
