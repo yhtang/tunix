@@ -203,15 +203,6 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       probabilities from the reference and policy models.
     """
     training_input["prompts"] = list(training_input["prompts"])
-    for i, prompt in enumerate(training_input["prompts"]):
-      n = len(prompt)
-      if n > 64:
-        prompt_peek = prompt[:16] + "..." + prompt[(n//2):(n//2+32)] + "..." + prompt[-16:]
-      else:
-        prompt_peek = prompt      
-      print(
-        f'Process {jax.process_index()}: micro batch sample {i}/{len(training_input["prompts"])}: {prompt_peek}'
-      )
     pad_value = self.rl_cluster.rollout.pad_id()
     eos_value = self.rl_cluster.rollout.eos_id()
     rollout_output = self.rl_cluster.generate(
@@ -318,7 +309,9 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       )
       self.rl_cluster.buffer_metrics(user_defined_metric, mode=mode)
 
-    train_ex = TrainExample(
+    # Shard TrainExample leaves along fsdp to align with data-parallel mental model.
+    return sharding_utils.shard_input(
+      TrainExample(
         prompt_ids=prompt_ids,
         prompt_mask=prompt_mask,
         completion_ids=completion_ids,
@@ -326,13 +319,9 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
         ref_per_token_logps=ref_per_token_logps,
         advantages=advantages,
         old_per_token_logps=old_per_token_logps,
+      ),
+      self.rl_cluster.cluster_config.training_config.data_sharding_axis,
     )
-    # Shard TrainExample leaves along fsdp to align with data-parallel mental model.
-    train_ex = sharding_utils.shard_input(
-        train_ex,
-        self.rl_cluster.cluster_config.training_config.data_sharding_axis,
-    )
-    return train_ex
 
   def _compute_trajectory_ids(
       self, example: TrainingInputT, steps: int
